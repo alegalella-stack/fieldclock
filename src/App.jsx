@@ -301,6 +301,21 @@ const btnSlate = {
   fontFamily: "inherit", fontWeight: 700, letterSpacing: "0.06em", cursor: "pointer", width: "100%",
 };
 
+// Nombre seguro para archivos a partir del nombre del empleado (sin acentos).
+function slugify(s) {
+  return String(s).normalize("NFD").replace(/[̀-ͯ]/g, "")
+    .toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || "empleado";
+}
+// Botón pequeño (XLSX/PDF/CSV) para la lista individual por empleado.
+function miniBtn(color, disabled) {
+  return {
+    padding: "6px 12px", borderRadius: 8, border: `1px solid ${color}55`,
+    background: `${color}1f`, color, fontSize: 11, fontFamily: "inherit",
+    fontWeight: 700, letterSpacing: "0.05em",
+    cursor: disabled ? "not-allowed" : "pointer", opacity: disabled ? 0.4 : 1,
+  };
+}
+
 function ReportsPanel({ records, employees }) {
   const now = new Date();
   const monthAgo = new Date(now.getTime() - 29 * 86400000);
@@ -311,6 +326,7 @@ function ReportsPanel({ records, employees }) {
   const [employeeId, setEmployeeId] = useState("all");
   const [msg, setMsg] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [busyEmp, setBusyEmp] = useState(null);
 
   const events = useMemo(() => buildEvents(records), [records]);
   const validation = useMemo(() => validateRange(startStr, endStr), [startStr, endStr]);
@@ -319,6 +335,18 @@ function ReportsPanel({ records, employees }) {
     return filterEvents(events, { reportType, start: validation.start, end: validation.end, employeeId });
   }, [events, validation, reportType, employeeId]);
   const previewRows = useMemo(() => eventsToRows(filtered.slice(0, PREVIEW_LIMIT)), [filtered]);
+
+  // Para "reporte individual por empleado": eventos del rango/tipo de TODOS
+  // los empleados, y conteo agrupado por persona (una sola pasada).
+  const rangeAllFiltered = useMemo(() => {
+    if (!validation.ok) return [];
+    return filterEvents(events, { reportType, start: validation.start, end: validation.end, employeeId: "all" });
+  }, [events, validation, reportType]);
+  const countByEmp = useMemo(() => {
+    const m = {};
+    for (const e of rangeAllFiltered) m[e.employeeId] = (m[e.employeeId] || 0) + 1;
+    return m;
+  }, [rangeAllFiltered]);
 
   const employeeName = employeeId === "all"
     ? "Todos los empleados"
@@ -346,6 +374,33 @@ function ReportsPanel({ records, employees }) {
       setMsg({ type: "error", text: `Error al generar ${formatName}: ${err?.message || err}` });
     } finally {
       setBusy(false);
+    }
+  }
+
+  // Exporta SOLO a un empleado, respetando el rango y tipo seleccionados.
+  async function runForEmployee(emp, exporter, formatName) {
+    setMsg(null);
+    if (!validation.ok) { setMsg({ type: "error", text: validation.error }); return; }
+    const empEvents = rangeAllFiltered.filter(e => e.employeeId === emp.id);
+    if (empEvents.length === 0) {
+      setMsg({ type: "error", text: `No hay registros de ${emp.name} en el rango seleccionado.` });
+      return;
+    }
+    setBusy(true); setBusyEmp(emp.id);
+    try {
+      const label = REPORT_TYPES.find(t => t.id === reportType)?.label || reportType;
+      const meta = {
+        title: `Reporte de Asistencia — ${label} — ${emp.name}`,
+        subtitle:
+          `Empleado: ${emp.name}   |   Rango: ${startStr} a ${endStr}   |   ` +
+          `Registros: ${empEvents.length}   |   Generado: ${new Date().toLocaleString("es-MX")}`,
+      };
+      await exporter(empEvents, `${reportType}-${slugify(emp.name)}`, meta);
+      setMsg({ type: "success", text: `✓ ${formatName} de ${emp.name} generado (${empEvents.length} registros).` });
+    } catch (err) {
+      setMsg({ type: "error", text: `Error al generar ${formatName} de ${emp.name}: ${err?.message || err}` });
+    } finally {
+      setBusy(false); setBusyEmp(null);
     }
   }
 
@@ -416,6 +471,45 @@ function ReportsPanel({ records, employees }) {
           <div style={{ marginTop: 12, fontSize: 13, color: msg.type === "error" ? "#f87171" : "#22d3a0" }}>{msg.text}</div>
         )}
       </div>
+
+      {/* ── Reporte individual por empleado ─────────────── */}
+      {employees.length > 0 && (
+        <div style={S.card}>
+          <div style={{ fontSize: 10, letterSpacing: "0.12em", color: "#64748b", marginBottom: 6 }}>REPORTE INDIVIDUAL POR EMPLEADO</div>
+          <div style={{ fontSize: 11, color: "#475569", marginBottom: 12 }}>
+            Usa el rango de fechas y el tipo de reporte de arriba. Cada botón descarga solo a esa persona.
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            {employees.map(emp => {
+              const n = countByEmp[emp.id] || 0;
+              const disabled = !validation.ok || n === 0 || busy;
+              const generating = busyEmp === emp.id;
+              return (
+                <div key={emp.id} style={{
+                  display: "flex", alignItems: "center", justifyContent: "space-between",
+                  gap: 10, padding: "8px 0", borderBottom: "1px solid #111c30", flexWrap: "wrap",
+                }}>
+                  <div style={{ minWidth: 150 }}>
+                    <span style={{ color: "#f1f5f9", fontSize: 13 }}>{emp.name}</span>
+                    <span style={{ color: "#475569", fontSize: 11, marginLeft: 8 }}>{n} registro(s)</span>
+                  </div>
+                  <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                    {generating ? (
+                      <span style={{ color: "#64748b", fontSize: 11 }}>⏳ Generando…</span>
+                    ) : (
+                      <>
+                        <button onClick={() => runForEmployee(emp, exportXLSX, "Excel")} disabled={disabled} style={miniBtn("#22d3a0", disabled)}>XLSX</button>
+                        <button onClick={() => runForEmployee(emp, exportPDF, "PDF")} disabled={disabled} style={miniBtn("#38bdf8", disabled)}>PDF</button>
+                        <button onClick={() => runForEmployee(emp, exportCSV, "CSV")} disabled={disabled} style={miniBtn("#94a3b8", disabled)}>CSV</button>
+                      </>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* ── Vista previa ────────────────────────────────── */}
       <div style={S.card}>
