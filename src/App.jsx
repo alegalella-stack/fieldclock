@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import {
   collection, addDoc, updateDoc, doc, onSnapshot,
   query, orderBy, setDoc, getDocs, deleteDoc
@@ -54,6 +54,424 @@ const S = {
     cursor: "pointer", width: "100%",
   },
 };
+
+// ════════════════════════════════════════════════════════════
+//  LÓGICA DE REPORTES (Entradas / Salidas / Completo)
+//
+//  Cada documento de `timeRecords` es un TURNO con entrada (clockIn*)
+//  y, si existe, salida (clockOut*). Aquí se "explota" cada turno en
+//  eventos individuales para poder reportarlos por separado.
+//  No hay coordenadas lat/lng en el esquema: la ubicación es la
+//  dirección de texto, que también se enlaza a Google Maps.
+// ════════════════════════════════════════════════════════════
+const REPORT_TYPES = [
+  { id: "completo", label: "Completo (Entrada + Salida)" },
+  { id: "entradas", label: "Entradas" },
+  { id: "salidas",  label: "Salidas" },
+];
+
+// Columnas del reporte (orden fijo, reutilizado por XLSX / CSV / vista previa)
+const COLUMNS = [
+  "Empleado", "Fecha", "Hora", "Evento", "Actividad",
+  "Cliente", "Ticket", "Ubicación / Dirección", "Mapa (GPS)", "Nota",
+];
+const MAP_COL = COLUMNS.indexOf("Mapa (GPS)");        // se omite en PDF
+const ADDRESS_COL = COLUMNS.indexOf("Ubicación / Dirección");
+
+function activityLabel(entryType) {
+  const qt = QUICK_TYPES.find(q => q.id === (entryType || "work"));
+  return qt ? qt.label : (entryType || "—");
+}
+
+// Las marcas de tiempo se guardan como string (resultado de `Date()`);
+// también soportamos epoch en ms por robustez.
+function parseTs(ts) {
+  if (ts === null || ts === undefined || ts === "") return null;
+  const d = new Date(ts);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+function fmtDate(d) {
+  return d.toLocaleDateString("es-MX", { year: "numeric", month: "2-digit", day: "2-digit" });
+}
+function fmtTime(d) {
+  return d.toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+// Cada turno produce 1 evento de Entrada y (si tiene salida) 1 de Salida.
+function buildEvents(records) {
+  const events = [];
+  for (const r of records) {
+    const base = {
+      employeeId: r.employeeId,
+      employeeName: r.employeeName || "—",
+      activity: activityLabel(r.entryType),
+      customer: r.customer || "",
+      ticket: r.ticket || "",
+      note: r.note || "",
+      recordId: r.id,
+    };
+    const inDate = parseTs(r.clockIn);
+    if (inDate) {
+      events.push({ ...base, kind: "in", eventType: "Entrada", date: inDate, address: r.clockInAddress || "" });
+    }
+    const outDate = parseTs(r.clockOut);
+    if (outDate) {
+      // Al hacer clock-out la app reutiliza la dirección de entrada.
+      events.push({ ...base, kind: "out", eventType: "Salida", date: outDate, address: r.clockOutAddress || r.clockInAddress || "" });
+    }
+  }
+  return events;
+}
+
+// Validación del rango: ambas requeridas + inicio <= fin.
+function validateRange(startStr, endStr) {
+  if (!startStr || !endStr) {
+    return { ok: false, error: "Selecciona la fecha inicial y la fecha final." };
+  }
+  const start = new Date(`${startStr}T00:00:00`);
+  const end = new Date(`${endStr}T23:59:59.999`);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+    return { ok: false, error: "Una de las fechas no es válida." };
+  }
+  if (start > end) {
+    return { ok: false, error: "La fecha inicial no puede ser posterior a la fecha final." };
+  }
+  return { ok: true, start, end };
+}
+
+function filterEvents(events, { reportType, start, end, employeeId }) {
+  return events
+    .filter(e => {
+      if (reportType === "entradas" && e.kind !== "in") return false;
+      if (reportType === "salidas" && e.kind !== "out") return false;
+      if (start && e.date < start) return false;
+      if (end && e.date > end) return false;
+      if (employeeId && employeeId !== "all" && e.employeeId !== employeeId) return false;
+      return true;
+    })
+    .sort((a, b) => a.date - b.date);
+}
+
+function eventsToRows(events) {
+  return events.map(e => [
+    e.employeeName,
+    fmtDate(e.date),
+    fmtTime(e.date),
+    e.eventType,
+    e.activity,
+    e.customer,
+    e.ticket,
+    e.address,
+    e.address ? mapsUrl(e.address) : "",
+    e.note,
+  ]);
+}
+
+function timestampSlug() {
+  const d = new Date();
+  const p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+}
+function buildFilename(reportType, ext) {
+  return `reporte-asistencia-${reportType}-${timestampSlug()}.${ext}`;
+}
+function triggerDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// ─── Exportadores ────────────────────────────────────────────
+// xlsx y jspdf son pesados: se cargan con import() dinámico (solo al
+// exportar, y por formato) para no inflar el bundle inicial.
+
+async function exportXLSX(events, reportType, meta) {
+  const XLSX = await import("xlsx");
+  const aoa = [];
+  if (meta) {
+    aoa.push([meta.title]);
+    aoa.push([meta.subtitle]);
+    aoa.push([]);
+  }
+  aoa.push(COLUMNS);
+  for (const row of eventsToRows(events)) aoa.push(row);
+
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  ws["!cols"] = [
+    { wch: 22 }, { wch: 12 }, { wch: 11 }, { wch: 9 }, { wch: 10 },
+    { wch: 18 }, { wch: 12 }, { wch: 34 }, { wch: 42 }, { wch: 30 },
+  ];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Asistencia");
+  XLSX.writeFile(wb, buildFilename(reportType, "xlsx"));
+}
+
+async function exportPDF(events, reportType, meta) {
+  const [{ jsPDF }, { default: autoTable }] = await Promise.all([
+    import("jspdf"),
+    import("jspdf-autotable"),
+  ]);
+  const docPdf = new jsPDF({ orientation: "landscape", unit: "pt", format: "a4" });
+  const pageWidth = docPdf.internal.pageSize.getWidth();
+
+  docPdf.setFont("helvetica", "bold");
+  docPdf.setFontSize(13);
+  docPdf.setTextColor(20, 30, 55);
+  docPdf.text(meta?.title || "Reporte de Asistencia", 40, 40);
+
+  let startY = 56;
+  if (meta?.subtitle) {
+    docPdf.setFont("helvetica", "normal");
+    docPdf.setFontSize(8);
+    docPdf.setTextColor(90, 100, 120);
+    const sub = docPdf.splitTextToSize(meta.subtitle, pageWidth - 80);
+    docPdf.text(sub, 40, startY);
+    startY += sub.length * 11 + 8;
+  }
+
+  // En PDF omitimos la columna del enlace (URL larga) y hacemos
+  // clicable la celda de dirección.
+  const pdfColumns = COLUMNS.filter((_, i) => i !== MAP_COL);
+  const pdfBody = eventsToRows(events).map(r => r.filter((_, i) => i !== MAP_COL));
+  const pdfAddressCol = ADDRESS_COL < MAP_COL ? ADDRESS_COL : ADDRESS_COL - 1;
+
+  autoTable(docPdf, {
+    startY,
+    head: [pdfColumns],
+    body: pdfBody,
+    styles: { fontSize: 7, cellPadding: 3, overflow: "linebreak", valign: "top" },
+    headStyles: { fillColor: [15, 23, 42], textColor: [255, 255, 255], fontStyle: "bold" },
+    alternateRowStyles: { fillColor: [245, 248, 252] },
+    columnStyles: { [pdfAddressCol]: { textColor: [14, 116, 180] } },
+    didDrawCell: (data) => {
+      if (data.section === "body" && data.column.index === pdfAddressCol) {
+        const ev = events[data.row.index];
+        if (ev && ev.address) {
+          docPdf.link(data.cell.x, data.cell.y, data.cell.width, data.cell.height, { url: mapsUrl(ev.address) });
+        }
+      }
+    },
+    didDrawPage: () => {
+      const page = docPdf.internal.getNumberOfPages();
+      docPdf.setFontSize(7);
+      docPdf.setTextColor(150, 160, 175);
+      docPdf.text(`Página ${page}`, pageWidth - 60, docPdf.internal.pageSize.getHeight() - 16);
+    },
+  });
+
+  docPdf.save(buildFilename(reportType, "pdf"));
+}
+
+function exportCSV(events, reportType) {
+  const escape = (v) => {
+    const s = String(v ?? "");
+    return /[",\n\r;]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = [COLUMNS, ...eventsToRows(events)]
+    .map(r => r.map(escape).join(","))
+    .join("\r\n");
+  // BOM para que Excel respete acentos UTF-8.
+  const blob = new Blob(["﻿" + lines], { type: "text/csv;charset=utf-8;" });
+  triggerDownload(blob, buildFilename(reportType, "csv"));
+}
+
+// ════════════════════════════════════════════════════════════
+//  PANEL DE REPORTES (UI) — visible solo para admin
+// ════════════════════════════════════════════════════════════
+const PREVIEW_LIMIT = 50;
+
+// Date -> "YYYY-MM-DD" en hora local (para <input type="date">).
+function toInputDate(d) {
+  const local = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
+  return local.toISOString().slice(0, 10);
+}
+
+const selectStyle = { ...S.input, cursor: "pointer", WebkitAppearance: "none", appearance: "none" };
+const btnBlue = {
+  padding: "13px", borderRadius: 12, border: "1px solid rgba(14,165,233,0.4)",
+  background: "rgba(14,165,233,0.12)", color: "#38bdf8", fontSize: 13,
+  fontFamily: "inherit", fontWeight: 700, letterSpacing: "0.06em", cursor: "pointer", width: "100%",
+};
+const btnSlate = {
+  padding: "13px", borderRadius: 12, border: "1px solid #1e3a5f",
+  background: "transparent", color: "#94a3b8", fontSize: 13,
+  fontFamily: "inherit", fontWeight: 700, letterSpacing: "0.06em", cursor: "pointer", width: "100%",
+};
+
+function ReportsPanel({ records, employees }) {
+  const now = new Date();
+  const monthAgo = new Date(now.getTime() - 29 * 86400000);
+
+  const [reportType, setReportType] = useState("completo");
+  const [startStr, setStartStr] = useState(toInputDate(monthAgo));
+  const [endStr, setEndStr] = useState(toInputDate(now));
+  const [employeeId, setEmployeeId] = useState("all");
+  const [msg, setMsg] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const events = useMemo(() => buildEvents(records), [records]);
+  const validation = useMemo(() => validateRange(startStr, endStr), [startStr, endStr]);
+  const filtered = useMemo(() => {
+    if (!validation.ok) return [];
+    return filterEvents(events, { reportType, start: validation.start, end: validation.end, employeeId });
+  }, [events, validation, reportType, employeeId]);
+  const previewRows = useMemo(() => eventsToRows(filtered.slice(0, PREVIEW_LIMIT)), [filtered]);
+
+  const employeeName = employeeId === "all"
+    ? "Todos los empleados"
+    : (employees.find(e => e.id === employeeId)?.name || "—");
+
+  function buildMeta() {
+    const label = REPORT_TYPES.find(t => t.id === reportType)?.label || reportType;
+    return {
+      title: `Reporte de Asistencia — ${label}`,
+      subtitle:
+        `Rango: ${startStr} a ${endStr}   |   Empleado: ${employeeName}   |   ` +
+        `Registros: ${filtered.length}   |   Generado: ${new Date().toLocaleString("es-MX")}`,
+    };
+  }
+
+  async function run(exporter, formatName) {
+    setMsg(null);
+    if (!validation.ok) { setMsg({ type: "error", text: validation.error }); return; }
+    if (filtered.length === 0) { setMsg({ type: "error", text: "No hay registros para los filtros seleccionados." }); return; }
+    setBusy(true);
+    try {
+      await exporter(filtered, reportType, buildMeta());
+      setMsg({ type: "success", text: `✓ ${formatName} generado (${filtered.length} registros).` });
+    } catch (err) {
+      setMsg({ type: "error", text: `Error al generar ${formatName}: ${err?.message || err}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const canExport = validation.ok && filtered.length > 0 && !busy;
+
+  return (
+    <div style={{ maxWidth: 980, margin: "0 auto", display: "flex", flexDirection: "column", gap: 20 }}>
+
+      {/* ── Filtros ─────────────────────────────────────── */}
+      <div style={S.card}>
+        <div style={{ fontSize: 10, letterSpacing: "0.12em", color: "#64748b", marginBottom: 16 }}>FILTROS DEL REPORTE</div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 14 }}>
+          <div>
+            <label style={S.label}>FECHA INICIAL <span style={{ color: "#f87171" }}>*</span></label>
+            <input type="date" value={startStr} max={endStr || undefined}
+              onChange={e => setStartStr(e.target.value)} style={S.input} />
+          </div>
+          <div>
+            <label style={S.label}>FECHA FINAL <span style={{ color: "#f87171" }}>*</span></label>
+            <input type="date" value={endStr} min={startStr || undefined}
+              onChange={e => setEndStr(e.target.value)} style={S.input} />
+          </div>
+          <div>
+            <label style={S.label}>EMPLEADO</label>
+            <select value={employeeId} onChange={e => setEmployeeId(e.target.value)} style={selectStyle}>
+              <option value="all">Todos los empleados</option>
+              {employees.map(emp => (
+                <option key={emp.id} value={emp.id}>{emp.name}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label style={S.label}>TIPO DE REPORTE</label>
+            <select value={reportType} onChange={e => setReportType(e.target.value)} style={selectStyle}>
+              {REPORT_TYPES.map(t => (
+                <option key={t.id} value={t.id}>{t.label}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+        {!validation.ok ? (
+          <div style={{ marginTop: 14, fontSize: 12, color: "#f87171" }}>⚠ {validation.error}</div>
+        ) : (
+          <div style={{ marginTop: 14, fontSize: 12, color: "#64748b" }}>
+            {filtered.length} registro(s) coinciden con los filtros · {employeeName}
+          </div>
+        )}
+      </div>
+
+      {/* ── Exportación ─────────────────────────────────── */}
+      <div style={S.card}>
+        <div style={{ fontSize: 10, letterSpacing: "0.12em", color: "#64748b", marginBottom: 12 }}>DESCARGAR</div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12 }}>
+          <button onClick={() => run(exportXLSX, "Excel")} disabled={!canExport}
+            style={{ ...S.btnGreen, opacity: canExport ? 1 : 0.4, cursor: canExport ? "pointer" : "not-allowed" }}>
+            {busy ? "⏳ Generando…" : "⬇ Excel (.xlsx)"}
+          </button>
+          <button onClick={() => run(exportPDF, "PDF")} disabled={!canExport}
+            style={{ ...btnBlue, opacity: canExport ? 1 : 0.4, cursor: canExport ? "pointer" : "not-allowed" }}>
+            {busy ? "⏳ Generando…" : "⬇ PDF"}
+          </button>
+          <button onClick={() => run(exportCSV, "CSV")} disabled={!canExport}
+            style={{ ...btnSlate, opacity: canExport ? 1 : 0.4, cursor: canExport ? "pointer" : "not-allowed" }}>
+            {busy ? "⏳ Generando…" : "⬇ CSV"}
+          </button>
+        </div>
+        {msg && (
+          <div style={{ marginTop: 12, fontSize: 13, color: msg.type === "error" ? "#f87171" : "#22d3a0" }}>{msg.text}</div>
+        )}
+      </div>
+
+      {/* ── Vista previa ────────────────────────────────── */}
+      <div style={S.card}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
+          <div style={{ fontSize: 10, letterSpacing: "0.12em", color: "#64748b" }}>VISTA PREVIA</div>
+          <div style={{ fontSize: 11, color: "#475569" }}>
+            {filtered.length > PREVIEW_LIMIT ? `Mostrando ${PREVIEW_LIMIT} de ${filtered.length}` : `${filtered.length} fila(s)`}
+          </div>
+        </div>
+        {filtered.length === 0 ? (
+          <div style={{ color: "#475569", textAlign: "center", padding: 28, fontSize: 13 }}>
+            No hay registros para mostrar con los filtros actuales.
+          </div>
+        ) : (
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+              <thead>
+                <tr>
+                  {COLUMNS.map(c => (
+                    <th key={c} style={{
+                      textAlign: "left", padding: "8px 10px", whiteSpace: "nowrap",
+                      color: "#64748b", borderBottom: "1px solid #1e3a5f", letterSpacing: "0.04em", fontWeight: 600,
+                    }}>{c}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {previewRows.map((row, ri) => (
+                  <tr key={ri}>
+                    {row.map((cell, ci) => {
+                      const isMap = COLUMNS[ci] === "Mapa (GPS)";
+                      const isEvent = COLUMNS[ci] === "Evento";
+                      return (
+                        <td key={ci} style={{
+                          padding: "7px 10px", borderBottom: "1px solid #111c30",
+                          color: isEvent ? (cell === "Entrada" ? "#22d3a0" : "#f87171") : "#cbd5e1",
+                          whiteSpace: isMap ? "nowrap" : "normal",
+                          maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis",
+                        }}>
+                          {isMap && cell ? (
+                            <a href={cell} target="_blank" rel="noopener noreferrer"
+                              style={{ color: "#0ea5e9", textDecoration: "none" }}>Ver mapa →</a>
+                          ) : (cell || <span style={{ color: "#334155" }}>—</span>)}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 // ════════════════════════════════════════════════════════════
 //  LOGIN SCREEN
@@ -283,7 +701,7 @@ export default function App() {
 
       {/* Nav */}
       <nav style={{ display: "flex", gap: 4, padding: "10px 20px 0", background: "#0a0f1c" }}>
-        {[["clock", "⏱ Clock"], ["log", "📋 Log"], ["admin", "⚙ Admin"]].map(([id, label]) => (
+        {[["clock", "⏱ Clock"], ["log", "📋 Log"], ...(adminAuthed ? [["reports", "📊 Reportes"]] : []), ["admin", "⚙ Admin"]].map(([id, label]) => (
           <button key={id} onClick={() => setView(id)} style={{
             padding: "7px 16px", borderRadius: "8px 8px 0 0",
             border: "1px solid", borderBottom: "none",
@@ -508,6 +926,11 @@ export default function App() {
           </div>
         )}
 
+        {/* ── REPORTES ──────────────────────────────────── */}
+        {view === "reports" && adminAuthed && (
+          <ReportsPanel records={records} employees={employees} />
+        )}
+
         {/* ── ADMIN ─────────────────────────────────────── */}
         {view === "admin" && (
           <div style={{ maxWidth: 480, margin: "0 auto", display: "flex", flexDirection: "column", gap: 20 }}>
@@ -603,6 +1026,9 @@ export default function App() {
                   }} style={{ background: "transparent", border: "1px solid #1e3a5f", borderRadius: 8, color: "#94a3b8", padding: "8px 16px", fontSize: 12, fontFamily: "inherit", cursor: "pointer" }}>
                     ⬇ Export All Records (JSON)
                   </button>
+                  <div style={{ fontSize: 11, color: "#475569", marginTop: 10 }}>
+                    Para reportes filtrados (Excel / PDF / CSV) usa la pestaña 📊 Reportes.
+                  </div>
                 </div>
               </>
             )}
