@@ -22,6 +22,47 @@ function formatDuration(ms) {
 function mapsUrl(address) {
   return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(address)}`;
 }
+// Link a Google Maps a partir de coordenadas exactas.
+function geoMapsUrl(lat, lng) {
+  return `https://www.google.com/maps/search/?api=1&query=${lat},${lng}`;
+}
+
+// ─── Geolocalización ────────────────────────────────────────
+// Pide la ubicación del dispositivo. Devuelve { lat, lng, accuracy }.
+// Requiere contexto seguro (https o localhost) y permiso del usuario.
+function getCurrentPosition() {
+  return new Promise((resolve, reject) => {
+    if (!("geolocation" in navigator)) {
+      reject(new Error("Geolocalización no soportada"));
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      pos => resolve({
+        lat: +pos.coords.latitude.toFixed(6),
+        lng: +pos.coords.longitude.toFixed(6),
+        accuracy: pos.coords.accuracy != null ? Math.round(pos.coords.accuracy) : null,
+      }),
+      err => reject(err),
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+    );
+  });
+}
+// Reverse geocoding gratuito (OpenStreetMap Nominatim), best-effort.
+// Devuelve la dirección como texto, o "" si falla / agota tiempo.
+async function reverseGeocode(lat, lng) {
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 6000);
+    const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}&zoom=18&accept-language=es`;
+    const res = await fetch(url, { headers: { Accept: "application/json" }, signal: ctrl.signal });
+    clearTimeout(t);
+    if (!res.ok) return "";
+    const data = await res.json();
+    return data.display_name || "";
+  } catch {
+    return "";
+  }
+}
 
 // ─── Quick Entry Types ───────────────────────────────────────
 const QUICK_TYPES = [
@@ -61,8 +102,10 @@ const S = {
 //  Cada documento de `timeRecords` es un TURNO con entrada (clockIn*)
 //  y, si existe, salida (clockOut*). Aquí se "explota" cada turno en
 //  eventos individuales para poder reportarlos por separado.
-//  No hay coordenadas lat/lng en el esquema: la ubicación es la
-//  dirección de texto, que también se enlaza a Google Maps.
+//  La ubicación se captura por GPS al fichar (clockInLat/Lng,
+//  clockOutLat/Lng) y se reverse-geocodifica a dirección de texto
+//  (clockInAddress/clockOutAddress). Registros antiguos sin GPS solo
+//  tienen la dirección escrita a mano.
 // ════════════════════════════════════════════════════════════
 const REPORT_TYPES = [
   { id: "completo", label: "Completo (Entrada + Salida)" },
@@ -73,7 +116,7 @@ const REPORT_TYPES = [
 // Columnas del reporte (orden fijo, reutilizado por XLSX / CSV / vista previa)
 const COLUMNS = [
   "Empleado", "Fecha", "Hora", "Evento", "Actividad",
-  "Cliente", "Ticket", "Ubicación / Dirección", "Mapa (GPS)", "Nota",
+  "Cliente", "Ticket", "Ubicación / Dirección", "Coordenadas", "Mapa (GPS)", "Nota",
 ];
 const MAP_COL = COLUMNS.indexOf("Mapa (GPS)");        // se omite en PDF
 const ADDRESS_COL = COLUMNS.indexOf("Ubicación / Dirección");
@@ -112,12 +155,21 @@ function buildEvents(records) {
     };
     const inDate = parseTs(r.clockIn);
     if (inDate) {
-      events.push({ ...base, kind: "in", eventType: "Entrada", date: inDate, address: r.clockInAddress || "" });
+      events.push({
+        ...base, kind: "in", eventType: "Entrada", date: inDate,
+        address: r.clockInAddress || "",
+        lat: r.clockInLat ?? null, lng: r.clockInLng ?? null,
+      });
     }
     const outDate = parseTs(r.clockOut);
     if (outDate) {
-      // Al hacer clock-out la app reutiliza la dirección de entrada.
-      events.push({ ...base, kind: "out", eventType: "Salida", date: outDate, address: r.clockOutAddress || r.clockInAddress || "" });
+      events.push({
+        ...base, kind: "out", eventType: "Salida", date: outDate,
+        address: r.clockOutAddress || r.clockInAddress || "",
+        // Si no hubo GPS de salida, usa el de entrada como referencia.
+        lat: r.clockOutLat ?? r.clockInLat ?? null,
+        lng: r.clockOutLng ?? r.clockInLng ?? null,
+      });
     }
   }
   return events;
@@ -153,18 +205,24 @@ function filterEvents(events, { reportType, start, end, employeeId }) {
 }
 
 function eventsToRows(events) {
-  return events.map(e => [
-    e.employeeName,
-    fmtDate(e.date),
-    fmtTime(e.date),
-    e.eventType,
-    e.activity,
-    e.customer,
-    e.ticket,
-    e.address,
-    e.address ? mapsUrl(e.address) : "",
-    e.note,
-  ]);
+  return events.map(e => {
+    const hasCoords = e.lat != null && e.lng != null;
+    const coords = hasCoords ? `${e.lat}, ${e.lng}` : "";
+    const map = hasCoords ? geoMapsUrl(e.lat, e.lng) : (e.address ? mapsUrl(e.address) : "");
+    return [
+      e.employeeName,
+      fmtDate(e.date),
+      fmtTime(e.date),
+      e.eventType,
+      e.activity,
+      e.customer,
+      e.ticket,
+      e.address,
+      coords,
+      map,
+      e.note,
+    ];
+  });
 }
 
 function timestampSlug() {
@@ -202,7 +260,7 @@ async function exportXLSX(events, reportType, meta) {
   const ws = XLSX.utils.aoa_to_sheet(aoa);
   ws["!cols"] = [
     { wch: 22 }, { wch: 12 }, { wch: 11 }, { wch: 9 }, { wch: 10 },
-    { wch: 18 }, { wch: 12 }, { wch: 34 }, { wch: 42 }, { wch: 30 },
+    { wch: 18 }, { wch: 12 }, { wch: 34 }, { wch: 20 }, { wch: 42 }, { wch: 30 },
   ];
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, "Asistencia");
@@ -249,8 +307,10 @@ async function exportPDF(events, reportType, meta) {
     didDrawCell: (data) => {
       if (data.section === "body" && data.column.index === pdfAddressCol) {
         const ev = events[data.row.index];
-        if (ev && ev.address) {
-          docPdf.link(data.cell.x, data.cell.y, data.cell.width, data.cell.height, { url: mapsUrl(ev.address) });
+        const hasCoords = ev && ev.lat != null && ev.lng != null;
+        if (ev && (ev.address || hasCoords)) {
+          const url = hasCoords ? geoMapsUrl(ev.lat, ev.lng) : mapsUrl(ev.address);
+          docPdf.link(data.cell.x, data.cell.y, data.cell.width, data.cell.height, { url });
         }
       }
     },
@@ -649,7 +709,6 @@ export default function App() {
   const [view, setView] = useState("clock");
   const [ticket, setTicket] = useState("");
   const [customer, setCustomer] = useState("");
-  const [address, setAddress] = useState("");
   const [note, setNote] = useState("");
   const [entryType, setEntryType] = useState("work"); // work | lunch | break | travel
   const [statusMsg, setStatusMsg] = useState(null);
@@ -697,23 +756,37 @@ export default function App() {
   async function handleClockIn() {
     if (!user) return;
     if (currentRecord) return flash("error", "You are already clocked in.");
-    if (entryType === "work" && !address.trim()) return flash("error", "Please enter the job site address.");
-    flash("loading", "Saving…");
+    // Ubicación 100% automática por GPS (ya no se escribe a mano).
+    flash("loading", "📍 Obteniendo ubicación…");
+    let pos = null, locNote = "";
+    try {
+      pos = await getCurrentPosition();
+    } catch (e) {
+      locNote = e?.code === 1 ? " — sin ubicación (permiso denegado)" : " — sin ubicación";
+    }
+    flash("loading", "Guardando…");
+    const geoAddress = pos ? await reverseGeocode(pos.lat, pos.lng) : "";
     try {
       await addDoc(collection(db, "timeRecords"), {
         employeeId: user.id,
         employeeName: user.name,
         clockIn: Date(),
         entryType,
-        clockInAddress: entryType === "work" ? address.trim() : null,
+        clockInAddress: geoAddress || null,
+        clockInLat: pos ? pos.lat : null,
+        clockInLng: pos ? pos.lng : null,
+        clockInAccuracy: pos ? pos.accuracy : null,
         customer: entryType === "work" ? customer.trim() : "",
         ticket: entryType === "work" ? ticket.trim() : "",
         note: note.trim(),
         clockOut: null,
         clockOutAddress: null,
+        clockOutLat: null,
+        clockOutLng: null,
+        clockOutAccuracy: null,
       });
-      setTicket(""); setCustomer(""); setAddress(""); setNote("");
-      flash("success", `✓ Clocked IN — ${entryType.toUpperCase()} at ${formatTime(Date.now())}`);
+      setTicket(""); setCustomer(""); setNote("");
+      flash("success", `✓ Clocked IN — ${entryType.toUpperCase()} at ${formatTime(Date.now())}${pos ? " 📍" : locNote}`);
     } catch (e) {
       flash("error", "Save failed: " + (e.message || "Check your connection."));
     }
@@ -721,14 +794,25 @@ export default function App() {
 
   async function handleClockOut() {
     if (!user || !currentRecord) return flash("error", "You are not clocked in.");
-    // Clock out at same address as clock-in (they're leaving the same site)
-    flash("loading", "Saving…");
+    // También captura GPS al salir (antes reusaba la dirección de entrada).
+    flash("loading", "📍 Obteniendo ubicación…");
+    let pos = null, locNote = "";
+    try {
+      pos = await getCurrentPosition();
+    } catch (e) {
+      locNote = e?.code === 1 ? " — sin ubicación (permiso denegado)" : " — sin ubicación";
+    }
+    flash("loading", "Guardando…");
+    const geoAddress = pos ? await reverseGeocode(pos.lat, pos.lng) : "";
     try {
       await updateDoc(doc(db, "timeRecords", currentRecord.id), {
         clockOut: Date(),
-        clockOutAddress: currentRecord.clockInAddress || null,
+        clockOutAddress: geoAddress || currentRecord.clockInAddress || null,
+        clockOutLat: pos ? pos.lat : null,
+        clockOutLng: pos ? pos.lng : null,
+        clockOutAccuracy: pos ? pos.accuracy : null,
       });
-      flash("success", `✓ Clocked OUT — ${formatDuration(Date.now() - currentRecord.clockIn)} shift`);
+      flash("success", `✓ Clocked OUT — ${formatDuration(Date.now() - currentRecord.clockIn)} shift${pos ? " 📍" : locNote}`);
     } catch (e) {
       flash("error", "Save failed: " + (e.message || "Check your connection."));
     }
@@ -886,20 +970,6 @@ export default function App() {
                       <label style={S.label}>SERVICE TICKET # <span style={{ color: "#334155" }}>(optional)</span></label>
                       <input value={ticket} onChange={e => setTicket(e.target.value)} placeholder="e.g. TK-1042" style={S.input} />
                     </div>
-                    <div>
-                      <label style={S.label}>JOB SITE ADDRESS <span style={{ color: "#f87171" }}>*</span></label>
-                      <input value={address} onChange={e => setAddress(e.target.value)} placeholder="123 Main St, City, State" style={S.input} />
-                    </div>
-                  </>
-                )}
-
-                {/* Travel-only fields */}
-                {entryType === "travel" && (
-                  <>
-                    <div>
-                      <label style={S.label}>DESTINATION <span style={{ color: "#334155" }}>(optional)</span></label>
-                      <input value={address} onChange={e => setAddress(e.target.value)} placeholder="e.g. 123 Main St or Customer Name" style={S.input} />
-                    </div>
                   </>
                 )}
 
@@ -909,9 +979,14 @@ export default function App() {
                   <input value={note} onChange={e => setNote(e.target.value)} placeholder={
                     entryType === "lunch" ? "Where are you eating?" :
                     entryType === "break" ? "Any details..." :
-                    entryType === "travel" ? "Vehicle, mileage start, etc." :
+                    entryType === "travel" ? "Destino, vehículo, km inicial, etc." :
                     "Additional details…"
                   } style={S.input} />
+                </div>
+
+                {/* La ubicación se captura automáticamente por GPS al fichar */}
+                <div style={{ fontSize: 11, color: "#475569", display: "flex", alignItems: "center", gap: 6 }}>
+                  📍 Tu ubicación se guarda automáticamente al dar Clock In / Out.
                 </div>
               </>
             )}
